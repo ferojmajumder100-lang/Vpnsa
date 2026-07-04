@@ -1,0 +1,6 @@
+{
+  "name": "Traffic Controller",
+  "description": "Multi-button VPN traffic control with floating overlay",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
