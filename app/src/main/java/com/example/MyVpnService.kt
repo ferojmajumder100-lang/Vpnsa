@@ -41,6 +41,10 @@ class MyVpnService : VpnService() {
     private var speedJob: Job? = null
     private var countdownJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Main + Job())
+    
+    // Bytes counters for notification like in professional apps
+    private var totalBytesIn = 0L
+    private var totalBytesOut = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -55,7 +59,6 @@ class MyVpnService : VpnService() {
             countdownJob?.cancel()
             countdownSeconds.value = 0
             updateVpnState()
-            showNotification(freezeParam || isTeleActive.value || isDwActive.value)
             return START_STICKY
         }
 
@@ -65,7 +68,6 @@ class MyVpnService : VpnService() {
             countdownJob?.cancel()
             countdownSeconds.value = 0
             updateVpnState()
-            showNotification(isFreezeActive.value || teleParam || isDwActive.value)
             return START_STICKY
         }
 
@@ -75,7 +77,6 @@ class MyVpnService : VpnService() {
             countdownJob?.cancel()
             countdownSeconds.value = 0
             updateVpnState()
-            showNotification(isFreezeActive.value || isTeleActive.value || dwParam)
             return START_STICKY
         }
 
@@ -89,7 +90,6 @@ class MyVpnService : VpnService() {
             // Start 10 seconds auto countdown with frozen state
             countdownSeconds.value = 10
             updateVpnState(forceFreeze = true)
-            showNotification(true)
             
             countdownJob?.cancel()
             countdownJob = scope.launch {
@@ -97,16 +97,12 @@ class MyVpnService : VpnService() {
                     delay(1000)
                     countdownSeconds.value -= 1
                 }
-                // When 10 seconds complete, unfreeze if none of the manual buttons are active
                 if (isVpnActive.value) {
                     updateVpnState()
-                    showNotification(isFreezeActive.value || isTeleActive.value || isDwActive.value)
                 }
             }
         } else {
-            // Already active, handle normal updates
             updateVpnState()
-            showNotification(isFreezeActive.value || isTeleActive.value || isDwActive.value)
         }
 
         startSpeedSimulator()
@@ -122,15 +118,13 @@ class MyVpnService : VpnService() {
         val dw = isDwActive.value
         val anyBlockActive = forceFreeze || freeze || tele || dw
         
-        // Avoid redundant updates
         if (vpnInterface != null && lastAnyBlockActive == anyBlockActive) {
             return
         }
         
-        // Debounce to prevent rapid toggling flicker
         lastUpdateJob?.cancel()
         lastUpdateJob = scope.launch {
-            delay(300) // Small delay to smooth out rapid clicks
+            delay(100) // Much faster debounce
             performVpnTransition(anyBlockActive)
         }
     }
@@ -144,26 +138,24 @@ class MyVpnService : VpnService() {
                 .setMtu(1500)
 
             if (anyBlockActive) {
-                // Capturing all traffic to block it
+                // Freeze Mode: Packets are sent to our virtual sink
                 builder.addRoute("0.0.0.0", 0)
             } else {
-                // Dummy route to keep VPN icon but allow normal traffic
+                // Active Mode: Dummy route to keep VPN icon visible
                 builder.addRoute("192.0.2.1", 32)
             }
 
-            // Establish new interface BEFORE closing old one for smooth transition
             val oldInterface = vpnInterface
             vpnInterface = builder.establish()
             
             try {
                 oldInterface?.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+            } catch (e: Exception) { }
             
             isCurrentlyFrozen = anyBlockActive
             lastAnyBlockActive = anyBlockActive
             isTrafficFrozen.value = anyBlockActive
+            showNotification(anyBlockActive)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -177,35 +169,32 @@ class MyVpnService : VpnService() {
                 if (!isVpnActive.value) {
                     downloadSpeed.value = "0.00 B/s"
                     uploadSpeed.value = "0.00 B/s"
-                    isTrafficFrozen.value = false
                 } else {
-                    val freeze = isFreezeActive.value
-                    val tele = isTeleActive.value
-                    val dw = isDwActive.value
+                    val dlFrozen = isFreezeActive.value || isTeleActive.value || (countdownSeconds.value > 0)
+                    val ulFrozen = isFreezeActive.value || isDwActive.value || (countdownSeconds.value > 0)
                     
-                    val dlFrozen = freeze || tele
-                    val ulFrozen = freeze || dw
-                    
-                    isTrafficFrozen.value = dlFrozen || ulFrozen
-
                     if (dlFrozen) {
                         downloadSpeed.value = "0.00 B/s"
                     } else {
-                        val dlBytes = 50 * 1024 + random.nextInt(450 * 1024) // 50 KB to 500 KB
+                        val dlBytes = 50 * 1024 + random.nextInt(450 * 1024)
+                        totalBytesIn += dlBytes
                         downloadSpeed.value = formatSpeed(dlBytes.toLong())
                     }
 
                     if (ulFrozen) {
                         uploadSpeed.value = "0.00 B/s"
                     } else {
-                        val ulBytes = 10 * 1024 + random.nextInt(90 * 1024)   // 10 KB to 100 KB
+                        val ulBytes = 10 * 1024 + random.nextInt(90 * 1024)
+                        totalBytesOut += ulBytes
                         uploadSpeed.value = formatSpeed(ulBytes.toLong())
                     }
+                    showNotification(dlFrozen || ulFrozen)
                 }
                 delay(1000)
             }
         }
     }
+
 
     private fun formatSpeed(bytes: Long): String {
         return if (bytes < 1024) {
@@ -270,15 +259,12 @@ class MyVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val text = if (isFrozen) {
-            "Traffic State: FROZEN/LIMITED"
-        } else {
-            "Traffic State: ACTIVE"
-        }
+        val statusText = if (isFrozen) "FROZEN" else "ACTIVE"
+        val dataText = "Download: ${formatDataSize(totalBytesIn)} | Upload: ${formatDataSize(totalBytesOut)}"
 
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Traffic Controller VPN Active")
-            .setContentText(text)
+            .setContentTitle("Traffic Controller: $statusText")
+            .setContentText(dataText)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -286,6 +272,14 @@ class MyVpnService : VpnService() {
 
         startForeground(1, notification)
     }
+
+    private fun formatDataSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val exp = (Math.log(bytes.toDouble()) / Math.log(1024.0)).toInt()
+        val pre = "KMGTPE"[exp - 1]
+        return String.format("%.1f %sB", bytes / Math.pow(1024.0, exp.toDouble()), pre)
+    }
+
 
     override fun onDestroy() {
         super.onDestroy()
